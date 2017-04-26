@@ -1,0 +1,50 @@
+This document describes usage of the data collection and service monitoring scripts used by NodeTracker.
+
+
+OVERVIEW
+
+Code consists of one primary script and multiple packages.
+
+probe.pl
+This is the primary script.  It walks all switches and routers to gather basic topology data, gathers SNMP data for any custom probes 
+you have configured, and runs NMAP against specified devices to identify OS and open tcp ports.  It also does email notifications of 
+out-of-bounds values on probes for which "Monitor Standard Deviation" is turned on.
+
+
+
+GETTING STARTED
+
+1) You need the latest version of Perl.  For the Windows platform, use Active Perl available from http://www.activestate.com.
+
+2) The following Perl packages are required by the above scripts.  These packages are available from http://www.cpan.org for the 
+Unix/Linux platform and from http://www.activestate.com if you are using a Windows platform.
+
+DBI
+DBD-Mysql
+TimeDate
+Net-SNMP
+Net-DNS
+Mail-Sendmail
+Crypt-Blowfish
+MIME-Base64
+
+Install these packages.  On the Windows platform, the easiest way to install the packages is by using PPM (the perl package manager).  
+From a command prompt, goto the bin directory of your perl distribution (e.g. c:\perl\bin) and type "ppm".  Once ppm is started, you can 
+install a package by type "install the-package-name" (e.g. "install DBI").
+
+
+3) If on a Unix/Linux platform, obtain nmap 2.54 or greater from http://www.insecure.org and install it.  
+   If on a Windows platform, obtain the NT port of nmap from http://www.eeye.com/html/Research/Tools/nmapnt.html.  
+   IMPORTANT NOTE for Windows users: do not use the libpcap drives included with the nmapnt download.  Rather use the latest 
+   version from http://netgroup-serv.polito.it/winpcap/.
+
+4) Edit nodetracker.conf as needed.  Mostly this will entail changing some directory paths.
+
+5) Your done.  Now you just need try running the script.  The required command line options are
+"-u username -p password -d databasename -e emailaddressforalerts -k privateEncryptionKey".  For example, you would have 
+something like "perl probe.pl -u joe -p mysecret -d mydatabase -e joe@yahoo.com -k mysecret".
+
+
+
+
+
