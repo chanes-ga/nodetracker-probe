@@ -1,0 +1,61 @@
+#####################################################################################################
+#
+# Section 1: General Config Options
+#
+#####################################################################################################
+
+nodetrackerserver       =       localhost	#shouldn't have to change this
+
+
+mailserver              =       mail.acme.com		#smtp server through which email alerts are relayed
+
+
+
+#############################################################################
+#comma separated list of emails to send alerts to
+emails			=	chanes@acme.com
+#the name of your database on nodetracker
+db			=	nt_somedb
+#your NodeTracker username, password, and encryption key
+username		=	tech
+password		=	password
+key			=	somerandomkey
+#############################################################################
+
+
+
+#logpath should end with / or \
+logpath			= 	/tmp/
+snmpstrings		= public
+
+
+#####################################################################################################
+#
+# Section 2: serviceScanner options
+#
+#####################################################################################################
+
+scannerInterval=500		#in seconds (how long to sleep between scans)
+
+# scannerRetriesBeforeAlert is the number of consecutive connect failures
+# before sending an email alert
+scannerRetriesBeforeAlert=3    
+
+
+
+#####################################################################################################
+#
+# Section 3: nmap configuration
+#
+#####################################################################################################
+
+# Frequency in days of nmap scans of known devices
+nmapInterval = 3
+
+
+#If Unix/Linux path should be something like below
+nmap                    =       /usr/bin/nmap
+
+#If Windows, path should be something like below
+#nmap                           =       c:\nmapnt\nmapnt.exe
+
