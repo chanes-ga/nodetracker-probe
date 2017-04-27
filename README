@@ -40,9 +40,9 @@ install a package by type "install the-package-name" (e.g. "install DBI").
 
 4) Edit nodetracker.conf as needed.  Mostly this will entail changing some directory paths.
 
-5) Your done.  Now you just need try running the script.  The required command line options are
+5) Your done.  Now you just need to try running the script.  The required command line options are
 "-u username -p password -d databasename -e emailaddressforalerts -k privateEncryptionKey".  For example, you would have 
-something like "perl probe.pl -u joe -p mysecret -d mydatabase -e joe@yahoo.com -k mysecret".
+something like "perl probe.pl -u joe -p mysecret -d mydatabase -e joe@yahoo.com -k myothersecret".
 
 
 
