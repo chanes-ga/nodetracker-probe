@@ -1,8 +1,7 @@
-#!/usr/bin/perl
 ##########################################################################################################################################
 # Program: walk.pm
 # Author:  Christopher Hanes
-# Revision: 0.6.2
+# Revision: 1.4.0
 # Changelog:
 # 09/14/01: modified VerifyPrimaryIP
 # 09/20/01: v0.2.0 finished major rewrite of entire code to support non-blocking SNMP queries.  
@@ -22,6 +21,15 @@
 # 05/10/02: v0.6.1 added lastupdated field to Port table to allow for cleaning out old data periodically
 # 06/04/02: v0.6.2 fixed problem in StorePorts to correlate BRIDGE MIB ifnum to normal MIB-2 interfaces ifnums; normally they are the 
 #		   the same but they are not in certain switches (such as Cisco)
+# 08/03/04: v1.0.0 added lastupdated field to IFDescriptions
+# 08/05/04: v1.0.1 added use strict and fixed resulting problems
+# 08/06/04: v1.0.2 FindUnknownDevices eliminated; IPs from RouterInterfaces now stored in IP table with sourceType=1
+# 08/12/04: v1.1.0 Added to code to determine switch topography (ie. details of crossover connections)
+# 08/13/04: v1.1.1 Crossover discovery moved to separate package
+# 08/17/04: v1.2.0 Crossover identification moved to Crossover.pm; stripped old code out of StorePorts
+# 08/26/05: v1.2.1 Minor bug fixes
+# 08/29/05: v1.3.0 ping of IP blocks before walk to improve results
+# 09/01/05: v1.4.0 eliminated dependency upon Devices.active and added procedure UpdateLastActive in walkfuncs
 ##########################################################################################################################################
 #    Copyright (C) 2001  Christopher A. Hanes
 #    
@@ -46,54 +54,54 @@ use globals;
 use Net::SNMP(qw(snmp_event_loop oid_lex_sort));
 use Net::DNS;
 use IO::Select;
+use walkfuncs;
+use Crossover;
+use strict;
 
 #All the data structures local to this package
-$dbh;
-$key;
-$keyvalid;
-$defaultcommunity;
-$lastactive;
-@sessions=(); 
-%routerIPs=();
-%ifs=();
-%ports=();
-%arpTable=();
-%forward=();
-$res = new Net::DNS::Resolver;
-$sel = new IO::Select();
+my $dbh;
+my $key;
+my $keyvalid;
+my $defaultcommunity;
+my $lastactive;
+my @sessions=(); 
+my %routerIPs=();
+my %ifs=();
+my %ports=();
+my %arpTable=();
+my %forward=();
+my $res = new Net::DNS::Resolver;
+my $sel = new IO::Select();
 
-@allDevices=(
+my @allDevices=(
 	 	 [$globals::IFDescriptionOID, 	[\%ifs,"descr",1] ]
-		,[$globals::IFSpeedOID, 		[\%ifs,"speed",1] ]
+		,[$globals::IFSpeedOID, 	[\%ifs,"speed",1] ]
 		,[$globals::IFPhysAddressOID, 	[\%ifs,"physAddress",1] ]
 		,[$globals::IFOpStatusOID, 	[\%ifs,"opstatus",1] ]
 	);		
-@allSwitches=(
+my @allSwitches=(
 		 [$globals::switchPortTypeTableOID, 	[\%ports,"type",6] ]
-		,[$globals::switchPortTableOID, 		[\%ports,"port",6] ]
+		,[$globals::switchPortTableOID, 	[\%ports,"port",6] ]
 		,[$globals::switchPortIFIndex, 		[\%ports,"offset",1] ]
 
 	);
-@allRouters=(
+my @allRouters=(
 		 [$globals::routerOID,		[\%arpTable,  "mac",    5] ]
-		,[$globals::routerIPOID,		[\%routerIPs, "address",4] ]
+		,[$globals::routerIPOID,	[\%routerIPs, "address",4] ]
 		,[$globals::routerIPMaskOID,	[\%routerIPs, "mask",   4] ]
 		,[$globals::routerIPIfnumOID,	[\%routerIPs, "ifnum",  4] ]
 	);
 
 
 
-require walkfuncs;
 
 
 
 sub main($){
 	#main procedure that initiates walk of layer 2/3 devices
-
 	$dbh=shift;
+	walkfuncs::Initialize($dbh);
 	$key=$globals::key;
-
-
 	$defaultcommunity=mycrypt::cryptText(1,"public",$key);
 
 
@@ -107,24 +115,40 @@ sub main($){
 		#data is encrypted; need to unencrypt
 		mycrypt::cryptAll(0,$key);	
 	}
-	$daybeforeyesterday=time()-2*24*3600;
+
+	#nmap::Initialize($dbh,$keyvalid,$key);
+	#nmap::pingNetworks();
+	
+	my $daybeforeyesterday=time()-2*24*3600;
+	ClearTable("delete from Crossovers where lastupdated<".($lastactive-3600*24*14) );
 	ClearTable("delete from Port where lastupdated<".($lastactive-3600*24*14) );
-	ClearTable("update Devices set active=0 where type not in($globals::typeRouter,$globals::typeSwitch)");
+	ClearTable("delete from MACData where lastupdated<".($lastactive-3600*24*14) );
+
+	#ClearTable("update Devices set active=0 where type not in($globals::typeRouter,$globals::typeSwitch)");
 	ClearTable("delete from IP");
 	ClearTable("delete from RouterIPs where IP not in('0','1') and lastupdated<$daybeforeyesterday");
-	$sql="select oid,MAC,PrimaryIP as IP, public,type from Devices left join SNMP_OID on SNMP_OID.shortoid=Devices.ifDescShortOID where type in($globals::typeRouter,$globals::typeSwitch)";
-	$sth=$dbh->prepare($sql);
+	ClearTable("delete from IFDescriptions where lastupdated<$daybeforeyesterday");
+
+	my $sql="select nodeID,oid,MAC,PrimaryIP as IP, public,type from Devices left join SNMP_OID on SNMP_OID.shortoid=Devices.ifDescShortOID 
+			where type in($globals::typeRouter,$globals::typeSwitch)";
+	my $sth=$dbh->prepare($sql);
 	$sth->execute();
 	my $r=$sth->fetchrow_hashref();
 	my $i=0;
-
+	my $mac;
+	my $nodeID;
+	my $ip;
+	my $community;
+	my $s;
+	print "Found ".$sth->rows." SNMP devices to walk.\n";	
 	while($r){
 		$mac=$r->{MAC};
+		$nodeID=$r->{nodeID};
 		$ip=$r->{IP};
 		$community=mycrypt::cryptText(0,$r->{public},$key);
-		print "Community for $ip is $community\n";
+		Log("Community for $ip is $community\n");
 		#print $r->{MAC}."\n".$r->{public}."|\t".length($community)."\t".$community."\n";
-		CheckForInOutOIDs($mac);
+		CheckForInOutOIDs($nodeID);
 	        my ($session, $error) = Net::SNMP->session(
         	        -hostname  => $ip,
 	                -community => $community,
@@ -143,7 +167,8 @@ sub main($){
 		$i++;
 	}
 	$sth->finish();
-
+	my $otherptr;
+	my $type;
 	foreach $s(@sessions) {
 	        $otherptr=$s->[1];
         	$type=$otherptr->[0];
@@ -154,7 +179,8 @@ sub main($){
 			PrepareSNMPCalls($s->[0],\@allRouters);
 		}
 		if (defined($otherptr->[2])){
-        	        $session->get_table(	
+			#????? need my?
+        	        $s->[0]->get_table(	
 	                     -baseoid => $otherptr->[2],
         	             -callback    => [\&SaveRouterIFs,$otherptr->[2]]
 	                );
@@ -167,10 +193,12 @@ sub main($){
 	StoreRouterIPs();
 	StorePorts();
 	StoreIP();
-	IdentifyUnused();
-	FindUnknownDevices($defaultcommunity);
+
+	IdentifyUnusedIPBlocks();
 	DoReverseLookups();
-	VerifyPrimaryIP();
+	#FindCrossovers($dbh);
+	#VerifyPrimaryIP();
+	UpdateLastActive();
 
 	foreach $s(@sessions) { $s->[0]->close(); }
 	
@@ -192,6 +220,9 @@ sub SaveRouterIFs(){
         my ($value,$ip);
         my ($key,$i);
         my ($session,$baseoid)=@_;
+	my $lasterror;
+	my $response;
+	my $oid;
         $ip=$session->hostname;
 	
 	my $sql="delete from RouterIFs where ip='$ip'";
@@ -221,6 +252,9 @@ sub ProcessLookups(){
 	my $timeout=5;
 	my @answer=();
 	my @ready=();
+	my $sock;
+	my $sql;
+	
 	while (@ready = $sel->can_read($timeout)) {
         	foreach $sock (@ready) {
 	                $packet = $res->bgread($sock);
@@ -242,7 +276,7 @@ sub ProcessLookups(){
 }
 sub DoReverseLookups(){
         my ($sql,$sth,$r,$ip,$s,$i);
-	$maxlookupqty=50;
+	my $maxlookupqty=50;
         Log("ReverseLookups\n");   
         $s=time();
         $sql="select IP from IP";
@@ -266,7 +300,7 @@ sub DoReverseLookups(){
 
 	#close off any remaining handles;
 	my @h=$sel->handles;
-	foreach $sock(@h){
+	foreach my $sock(@h){
 	        $sock->close();
 	}  
         Log("\n\n");
@@ -275,10 +309,11 @@ sub DoReverseLookups(){
 
 sub PrepareSNMPCalls($$){
 	my ($ptr, $oid, $argptr);
-	$session=shift;
-	$listptr=shift;
-	@snmpArgs=@$listptr;
-
+	my $tmp;
+	my $session=shift;
+	my $listptr=shift;
+	my @snmpArgs=@$listptr;
+	
         foreach $ptr(@snmpArgs){
                 $oid=$ptr->[0];
                 $argptr=$ptr->[1];
@@ -287,34 +322,34 @@ sub PrepareSNMPCalls($$){
                      -callback    => [\&ProcessSNMPResults, $argptr]
                 );
         }
-
 }
 
 sub StoreIP(){
-	my ($routerip,$ip,$sth,$mac,$ifnum,$int_ip,$host);
+	my ($routerip,$ip,$sth,$mac,$ifnum,$int_ip,$host,$sql);
 	my @tmp=();
-
+	Log("StoreIP: Start\n");
 	foreach $routerip(keys %arpTable){
 		Log("Storing IP Table from $routerip\n");
 		my @ips=keys %{ $arpTable{$routerip}{mac} };
 		foreach $ip(@ips){
 			$mac=$arpTable{$routerip}{mac}{$ip};
+			Log("ip: $ip  mac: $mac\n");
+
 			($ifnum,@tmp)=split(/\./,$ip);
 			$ip=join("\.",@tmp);
+
+
 			$mac=fixMAC($mac);
+			if (length($mac)>0){
+				#ARP table by definition better have a valid MAC
+				$int_ip=toAddress($ip);			
 
-			$int_ip=toAddress($ip);
-			
-	                #$host = (gethostbyaddr(pack("C4",split(/\./,$ip)),2))[0];
-			#print "$routerip\t$ip\t$int_ip\t$ifnum\t$mac\n";
-
-	                $sql="insert into IP(ip,address,mac,routerif) values('$ip',$int_ip,'$mac',$ifnum)";
-                	#print "$sql\n";
-	                $sth=$dbh->prepare($sql);
-        	        $sth->execute();
-                 
-			Log("a");
-
+		                $sql="insert into IP(ip,address,mac,routerif,sourceIP) values('$ip',$int_ip,'$mac',$ifnum,'$routerip')";
+        	        	Log("$sql\n\n");
+	        	        $sth=$dbh->prepare($sql);
+        	        	$sth->execute();
+				Log("a");	
+			}
 		}
 		Log("\n");
 		$sth->finish();
@@ -322,83 +357,87 @@ sub StoreIP(){
 		
 
 }
-sub StorePorts(){
-	my ($ip,$sth,$mactype,$ifnum,$maxIf,$i,$newifnum);
-	my @macs=();
+sub StoreOnePort($$$$){
+	my $ip=shift;
+	my $mac=shift;
+	my $ifnum=shift;
+	my $mactype=shift;
+	my $sql;
+	my $sth;
+	#print "ip=$ip\tmac=$mac\tif=$ifnum\t$mactype\tlast=$lastactive\n";
 
+	#mactype=3 == a learned address
+
+	Log("p");
+
+	$mac=HexMac($mac);
+                        
+	if ($mactype==3){
+        	$sql="insert into Port(switch,ifnum,mac,lastupdated) values('$ip',$ifnum,'$mac',$lastactive)";
+	        $sth=$dbh->prepare($sql);
+        	$sth->execute();
+        }else{
+        	Log("\nAddress not learned: $mac\n");
+	}
+	#store everything in tmp table MACData so we can figure out crossover connections
+	$sql="insert into MACData(switch,ifnum,mac,lastupdated)values ('$ip',$ifnum,'$mac',$lastactive)";
+	$sth=$dbh->prepare($sql);
+	$sth->execute();
+}
+sub StorePorts(){
+	my ($ip,$r,$sth,$sth2,$sql,$mactype,$ifnum,$maxIf,$i,$newifnum,$mac);
+	my @macs=();
+	$maxIf=0;
 	foreach $ip(keys %ports){
 		Log("Storing Ports for $ip\n");
 		@macs=keys % { $ports{$ip}{type} };
-
+		#Log("$ip: @macs\n");
 	        ClearTable("delete from Port where Switch='$ip'");
+	        ClearTable("delete from MACData where Switch='$ip'");
 		my @addressCount=();
 
 		foreach $mac(@macs){
+			$ifnum=-1;
+			$newifnum=-1;
 			$mactype=$ports{$ip}{type}{$mac};
 			$ifnum=$ports{$ip}{port}{$mac};	#this may not be the real ifnum
-			$newifnum=$ports{$ip}{offset}{$ifnum};  #this will grab the real ifnum
-			print "Testing: $ifnum\t$newifnum\n";
-			$ifnum=$newifnum;
-			#print "$ip\t$mac\t$ifnum\t$mactype\n";
-
-
-	                #mactype=3 == a learned address
-
-	                if ($mactype==3){
-        	                $addressCount[$ifnum]+=1;
-                	        if ($ifnum>$maxIf){
-                        	        $maxIf=$ifnum;
-                        	}
-	                }else{
-        	                Log("\nAddress not learned: $mac\n");
-                	}
-	                Log("p");
-                        
-	                if (($mactype==3)&&($addressCount[$ifnum]<2)){
-        	                $mac=HexMac($mac);
-                	        $sql="insert into Port(switch,ifnum,mac,lastupdated) values('$ip',$ifnum,'$mac',$lastactive)";
-	                        $sth=$dbh->prepare($sql);
-        	                $sth->execute();
-                	        $sql="update Devices set lastactive=$lastactive,active=1 where MAC='$mac'";
-                        	$sth=$dbh->prepare($sql);
-	                        $sth->execute();
-                	}
+			#print "Testing: $ifnum\t$newifnum\n";
+			if(defined($ifnum)){
+				$newifnum=$ports{$ip}{offset}{$ifnum};  #this will grab the real ifnum
+				if (defined($newifnum)){
+					#print "Testing2: $ifnum\t$newifnum\n";
+					$ifnum=$newifnum;
+				}
+				StoreOnePort($ip,$mac,$ifnum,$mactype);
+			}
 
 		}
 		Log("\n");
-
-	        for ($i=0;$i<=$maxIf;$i++){
-        	        if ($addressCount[$i]>1){
-				my $mac="$ip\.$i";
-                	        Log("Interface $i is an uplink on $ip\n");
-                        	$sql="update Port set uplink=1,MAC='$mac' where Switch='$ip'
-					and ifnum=$i";
-	                        #print "$sql\n";
-        	                $sth=$dbh->prepare($sql);
-                	        $sth->execute();
-				
-				$sql="select MAC from Devices where MAC='$mac'";
-				$sth=$dbh->prepare($sql);
-				$sth->execute();
-				if($sth->rows==0){
-	                        	$sql="insert into Devices(MAC,description) values('$mac','Crossover Link')";
-			                $sth=$dbh->prepare($sql);
-        	        	        $sth->execute();        
-				}
-        	        }
-
-	        }
 	}
+	#clean out ports with multiple macs on them (ie will later be identified as crossovers)
+	$sql="select count(*) as c,Switch,ifnum from Port group by Switch,ifnum having c>1";
+	$sth=$dbh->prepare($sql);
+	$sth->execute();
+	$r=$sth->fetchrow_hashref();
+	while($r){
+		$sql="delete from Port where Switch='$r->{Switch}' and ifnum=$r->{ifnum}";
+		Log("$sql\n");
+		$sth2=$dbh->prepare($sql);
+		$sth2->execute();
+		$r=$sth->fetchrow_hashref();
+	}
+
 }
 sub StoreRouterIPs(){
 	my ($routerip, $sql,$sth,$mask,$ifnum,$int_ip,$int_mask,$int_network,$now);
 	$now=time();
+	Log("StoreRouterIPs: Start\n");
 	foreach $routerip(keys %routerIPs){
 		Log("Storing Router IP info for $routerip\n");
 		
 		my @addresses=keys %{ $routerIPs{$routerip}{address} };
 
-		foreach $ip(@addresses){
+		foreach my $ip(@addresses){
 			$mask=$routerIPs{$routerip}{mask}{$ip};
 			$int_ip=toAddress($ip);
 			$int_mask=toAddress($mask);
@@ -410,22 +449,42 @@ sub StoreRouterIPs(){
 					mask=$int_mask where IP='$routerip' and network=$int_network";
 			$sth=$dbh->prepare($sql);
 			$sth->execute();
+
+
+
 			if ($sth->rows==0){
 		                $sql="insert into RouterIPs(IP,ifnum,address,mask,network,lastupdated)
         		                values('$routerip',$ifnum, $int_ip,$int_mask,$int_network,$now)";
 				#print $sql."\n";
 	                	$sth=$dbh->prepare($sql);
-        	        	$sth->execute();
+        	        	$sth->execute();		
 			}
+			#test
+			$sql="insert into IP(IP,routerif,address,sourceType,sourceIP)
+				values('$ip',$ifnum,$int_ip,1,'$routerip')";
+			Log("$sql\n");
+	                $sth=$dbh->prepare($sql);
+        	        $sth->execute();
+
 			Log("r");
 		}
+
+
 		#$sth->finish();
 		Log("\n");
 	}
+	#fill in MAC where possible...
+	$sql="update IP,IFDescriptions set IP.MAC=physAddress where IP.sourceIP=IFDescriptions.IP and 
+		IP.routerif=IFDescriptions.ifnum and sourceType=1";
+	$sth=$dbh->prepare($sql);
+        $sth->execute();
+
 
 }
 sub StoreIfDescriptions(){
-	my ($sth,$ip,$ifdescr,$ifspeed,$ifOpStatus);
+	my ($sth,$sql,$ip,$ifdescr,$ifspeed,$ifOpStatus,$ifnum,@ifnums,$ifPhysAddress);
+	my $now=time();
+	
 	foreach $ip(keys %ifs){
 		Log("Storing if info for $ip\n");
 		@ifnums=keys %{ $ifs{$ip}{descr} };
@@ -437,6 +496,9 @@ sub StoreIfDescriptions(){
 			$ifspeed=$ifs{$ip}{speed}{$ifnum}/8;
 			$ifOpStatus=$ifs{$ip}{opstatus}{$ifnum};
 			$ifPhysAddress=$ifs{$ip}{physAddress}{$ifnum};
+			if($ifPhysAddress!~m/\w+/){
+				$ifPhysAddress="";
+			}
 			if(length($ifPhysAddress)==14){
 				$ifPhysAddress=fixMAC($ifPhysAddress);
 			}
@@ -444,12 +506,14 @@ sub StoreIfDescriptions(){
 				$ifOpStatus=0;
 			}
 			#print "$ip\t$ifnum\t$ifdescr\t$ifspeed\t$ifstatus\n";
-	                $sql="insert into IFDescriptions(IP,ifnum,description,speed,opStatus,physAddress) values('$ip',$ifnum,'$ifdescr',$ifspeed,$ifOpStatus,'$ifPhysAddress')";
-	                #print "$sql\n";
+		        $sql="insert into IFDescriptions(IP,ifnum,description,speed,opStatus,physAddress,lastupdated) 
+				values('$ip',$ifnum,'$ifdescr',$ifspeed,$ifOpStatus,'$ifPhysAddress',$now)";
+			Log("$sql\n");
         	        Log("i");
-                	$sth=$dbh->prepare($sql);
-	                $sth->execute(); 
-		}
+	                $sth=$dbh->prepare($sql);
+		        $sth->execute(); 
+			
+		}	
 		$sth->finish;
 		Log("\n");
 
@@ -462,6 +526,7 @@ sub ProcessSNMPResults(){
 	my ($key,$i);
 	my @tmp=();
 	my ($session,$otherptr)=@_;
+	my ($lasterror, $response);
         $ip=$session->hostname;
 	
 	my $hashptr=$otherptr->[0];
@@ -476,7 +541,7 @@ sub ProcessSNMPResults(){
         }
                 
         $response = $session->var_bind_list;
-        foreach $oid(oid_lex_sort(keys(%{$response}))) {
+        foreach my $oid(oid_lex_sort(keys(%{$response}))) {
                 (@tmp)=split(/\./,$oid);
 		$key="";
                 for ($i=$keyparts;$i>=0;$i--){
@@ -485,12 +550,10 @@ sub ProcessSNMPResults(){
 		chop($key);
                 $value=$response->{$oid};
 		$hashptr->{$ip}{$field}{$key}=$value;
-		#print "$key\t$value\n";
+		#Log("oid: $oid k: $key\tv: $response->{$oid} $value \n");
 		#print ".";
         }                 
 	#print "\n";
 }
 
-
 1;
-

@@ -34,7 +34,7 @@ use Crypt::Blowfish;
 use MIME::Base64; 
 
 
-$dbh;
+my $dbh;
 
 sub Initialize($){
 	print "Initializing package crypt\n";

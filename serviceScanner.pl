@@ -2,12 +2,13 @@
 ##########################################################################################################################################
 # Program: serviceScanner.pl
 # Author:  Christopher Hanes
-# Revision: 0.1.4
+# Revision: 1.0.0
 # Changelog:
 # 10/31/01: v0.1.2 mail handling now provided by Mail::Sendmail package to provide win2k support
 #	    configuration read from nodetracker.conf
 # 11/01/01: v0.1.3 more config variable read from conf file; output messages now directed to logfile
 # 11/09/01: v0.1.4 improved startup from different calling paths
+# 12/15/05: v1.0.0 major rewrite; using IO::Select and IO::Socket::INET now
 ##########################################################################################################################################
 #    Copyright (C) 2001  Christopher A. Hanes
 #    
@@ -29,77 +30,115 @@
 
 use Socket;
 use IO::Select;
+use IO::Socket::INET;
 use Errno;
 use Date::Parse;
 use Date::Format qw(time2str);
 
-#read config file, set up global variables
 
 ### this section common to all code
-($path,$program)=getPathInfo();
-$commoncode=$path."common.pl";
+my ($path,$program)=&getPathInfo();
 
-Log("Sending notifications to $emails\n");
+#this must loaded first in order for other packages to work correctly
+use globals;
+
+globals::Initialize($path,$program);
+
+#Log("Sending notifications to $emails\n");
 
 my $sth;
-$sleeptime=$conf{"scannerInterval"};
-$maxFailures=$conf{"scannerRetriesBeforeAlert"};
+$sleeptime=$globals::conf{"scannerInterval"}+0;
+$maxFailures=$globals::conf{"scannerRetriesBeforeAlert"};
+$ignoreFailures=$globals::conf{"scannerFailuresBeforeIgnore"};
 %currentFailures=();
+%description=();
 while(1)
 {
 
-$dbh=DBI->connect($dsn,$user,$password);
+
+$dbh = DBI->connect($globals::dsn,$globals::user,$globals::password);
 
 
-$sql="select PrimaryIP,nmap.MAC,Port,Service,Devices.Description from nmap left join Devices using(MAC) where active=1 and RunNMAP=1 
-order by PrimaryIP";
+$portSQL= "and Port in (".$globals::conf{portWatchList}.") ";
+$sql="select PrimaryIP,nmap.nodeID,Port,Service,Devices.Description from nmap left join Devices using(nodeID) where active=1 and state='open' and PrimaryIP<>'' $portSQL  and RunNMAP=1 order by PrimaryIP limit 100";
+print "$sql\n";
 $sth=$dbh->prepare($sql);
 $sth->execute();
 if ($sth->rows>0){
+	 $sel = IO::Select->new();
+
 	$r=$sth->fetchrow_hashref();
 	while($r){
 		$host=$r->{PrimaryIP};
 		($port,$protocol)=split("\/",$r->{Port});
 		
-		#print $r->{PrimaryIP}."\t".$r->{Description}."\t$port $protocol\t".$r->{Service}."\n";
-		$description="$host:$port ($r->{Service} on $r->{Description})";
-		attemptConnection($host,$port,$description);
+		print $r->{PrimaryIP}."\t".$r->{Description}."\t$port $protocol\t".$r->{Service}."\n";
+		$ip=$r->{PrimaryIP};
+		$tag="$ip:$port";
+
+		$description{$tag}=$r->{Description};
+		if($currentFailures{$tag}<=$ignoreFailures){
+	   		my $sock = IO::Socket::INET->new(PeerAddr => $ip,
+        	                         PeerPort => $port,
+                	                 Proto    => 'tcp',
+					 Blocking =>0,
+					 Timeout =>2
+				);
+	
+			#assume failure
+			if (defined($currentFailures{$tag})){
+				$currentFailures{$tag}++;
+			}else{
+				$currentFailures{$tag}=1;
+			}
+			
+			$sel->add($sock);		
+		}
+
 		$r=$sth->fetchrow_hashref();
 
+
 	}
+
+	#print "Select Count:".$sel->count()."\n";
+	while(@t=$sel->can_write()){
+		foreach $sock(@t){
+			if($sock->connected){
+				$tag=$sock->peerhost.":".$sock->peerport;
+				#print "connected to $tag\n";
+				$currentFailures{$tag}=0;
+				shutdown($sock, 2);
+
+			}	
+			$sel->remove($sock);
+			$j++;
+		}
+		$i++;
+		#print "Select Count ".$sel->count()."\n";
+	}
+	$body="";
+	foreach $key(%currentFailures){
+		if($currentFailures{$key}>=1){
+			print "Can't connect to $key.  Failure #".$currentFailures{$key}."\n";
+		}
+		if(($currentFailures{$key}>=$maxFailures)&&($currentFailures{$key}<$ignoreFailures)){
+			$body=$body."$key on $description{$key} is down, failure #".$currentFailures{$key}."\n";
+
+		}
+		if($currentFailures{$key}==$ignoreFailures){
+			$body=$body."$key on $description{$key} is STILL down - last alert!!\n";
+		}
+	}
+	print "BODY:\n$body\n";
+	if(length($body)>0){
+		SendEmail("Services Down!",$body);
+	}
+
 }
 $sth->finish();
 $dbh->disconnect();
-Log("Sleeping $sleeptime\n");
+print "Sleeping $sleeptime\n";
 sleep($sleeptime);
-}
-
-sub attemptConnection($){
-	my $host=shift;
-	my $port=shift;
-	my $description=shift;
-
-	my $iaddr=inet_aton($host);
-	my $paddr=sockaddr_in($port,$iaddr);
-	my $proto=getprotobyname('tcp');
-	my $socket;
-	socket($socket,PF_INET,SOCK_STREAM,$proto)||die "Unable to create socket to $description\n";
-	#my $val = fcntl ($socket, F_GETFL, 0);
-	#fcntl ($socket, F_SETFL, $val|O_NONBLOCK);
-	if (connect($socket,$paddr)){
-		$currentFailures{$description}=0;
-		Log("Connection succeeded on $description\n");
-		close($socket);
-	}else{
-		$body="Failure on $description\nWith error: ".$!;
-		Log($body);
-		if ($currentFailures{$description}<=$maxFailures){
-			$currentFailures{$description}+=1;
-		}else{
-			$currentFailures{$description}=0;
-			SendEmail($mailserver,"Service Down!",$body);
-		}
-	}
 }
 
 

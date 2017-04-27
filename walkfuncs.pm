@@ -1,26 +1,51 @@
 ##########################################################################################################################################
 # Program: walkfuncs.pm
 # Author:  Christopher Hanes
-# Revision: 0.5.0
+# Revision: 1.2.0
 # Changelog:
 # 03/06/02: v0.5.0 fixed alot of bugs and warnings output from perl -w
+# 08/05/04: v1.0.0 made walkfuncs a package
+# 08/05/04: v1.0.1 added use strict and fixed resulting problems
+# 08/06/04: v1.0.2 FindUnknownDevices eliminated and changed to fixMAC
+# 08/22/05: v1.0.3 Eliminated use of Math::BigInt due to problems calculating gcd on FC3:
+#		   Specifically, the error was
+#			Can't use an undefined value as an ARRAY reference at /usr/local/lib/perl5/5.8.0/Math/BigInt/Calc.pm 
+# 08/30/05: v1.0.4 bug fix to MaxSubnetSize when offset is 0
+# 09/01/05: v1.1.0 added UpdateLastActive procedure
+# 12/15/05: v1.2.0 changes to fixMAC to deal with hex strings coming in as binary - see note in fixMAC
 ##########################################################################################################################################
+package walkfuncs;
+use globals;
+use strict;
+
+require Exporter;
+
+our @ISA = qw(Exporter);
+our @EXPORT = ('ClearTable','CheckForInOutOIDs','toAddress','toNetBits','toIP', 'FixPrimaryIP','VerifyPrimaryIP','IdentifyUnusedIPBlocks',
+	'computeNetSize','DescribeIPBlocks','FillIPBlocks','FillFreeSpace','log2','GetMask',
+	'MaxSubnetSize','HexMac','DecMac','fixMAC','UpdateLastActive');
+
+
+my $dbh;
+sub Initialize($){
+	$dbh=shift;
+}
 sub CheckForInOutOIDs($){
 	#This is needed to make sure each router/switch has refids for collecting basic in/out octects
-	my $mac=shift;
+	my $nodeID=shift;
 	my ($sth,$sql,$r);
-	$sql="select * from OID_Instances where MAC='$mac' and shortoid in(21,22)";
+	$sql="select * from OID_Instances where nodeID=$nodeID and shortoid in(21,22)";
 	$sth=$dbh->prepare($sql);
 	$sth->execute();
 	my $c=$sth->rows;
 
 	if($c==0){
 		#need to add both in and out
-		$sql="insert into OID_Instances(MAC,shortoid) values('$mac',21)";
+		$sql="insert into OID_Instances(nodeID,shortoid) values($nodeID,21)";
 		$sth=$dbh->prepare($sql);
 		$sth->execute();
 		Log($sql."\n");
-		$sql="insert into OID_Instances(MAC,shortoid) values('$mac',22)";
+		$sql="insert into OID_Instances(nodeID,shortoid) values($nodeID,22)";
 		Log($sql."\n");
 		$sth=$dbh->prepare($sql);
 		$sth->execute();
@@ -30,9 +55,9 @@ sub CheckForInOutOIDs($){
 		#only need to add one...
 		$r=$sth->fetchrow_hashref();
 		if ($r->{shortoid}==21){
-			$sql="insert into OID_Instances(MAC,shortoid) values('$mac',22)";
+			$sql="insert into OID_Instances(nodeID,shortoid) values($nodeID,22)";
 		}else{
-			$sql="insert into OID_Instances(MAC,shortoid) values('$mac',21)";
+			$sql="insert into OID_Instances(nodeID,shortoid) values($nodeID,21)";
 		}
 		Log($sql."\n");
 		$sth=$dbh->prepare($sql);
@@ -44,6 +69,7 @@ sub CheckForInOutOIDs($){
 sub toAddress($){
         my $ip=shift;
         my @oct=split(/\./,$ip);
+	my $o;
         my $address=0;
         my $shiftbits=24;
         foreach $o(@oct){
@@ -96,18 +122,21 @@ sub FixPrimaryIP(){
 		$sth2->execute();
 		if($sth2->rows>0){
 			$r2=$sth2->fetchrow_hashref();
-			$ip=toIP($r2->{address});
-			$sql="update Devices set PrimaryIP='$ip',IPAutoFill=0 where MAC='$r->{MAC}'";
-			Log("$sql\n");
-			$sth2=$dbh->prepare($sql);
-			$sth2->execute();
+			if (defined($r2->{address})){
+				$ip=toIP($r2->{address});
+				$sql="update Devices set PrimaryIP='$ip',IPAutoFill=0 where MAC='$r->{MAC}'";	
+				Log("$sql\n");
+				$sth2=$dbh->prepare($sql);
+				$sth2->execute();
+			}
 		}
 		$r=$sth->fetchrow_hashref();
 	}
 }
 sub VerifyPrimaryIP(){
-	$sql="select MAC,PrimaryIP,type from Devices";
-	$sth=$dbh->prepare($sql);
+	my $sql="select MAC,PrimaryIP,type from Devices";
+	my $sth=$dbh->prepare($sql);
+	my ($sth2,$r2);
 	$sth->execute();
 	my $r=$sth->fetchrow_hashref();
 	while ($r){
@@ -159,8 +188,8 @@ sub VerifyPrimaryIP(){
 	$sth->finish();
 	FixPrimaryIP();	
 }
-sub IdentifyUnused(){
-	my ($sth, $sth2,$sql);
+sub IdentifyUnusedIPBlocks(){
+	my ($sth, $sth2,$sql,$network,$mask,$netsize,$netend);
 	$sql="delete from RouterIPs where ip='0'";
 	$sth=$dbh->prepare($sql);
 	$sth->execute();
@@ -173,7 +202,7 @@ sub IdentifyUnused(){
         	$network=$r->{network};
         	$mask=$r->{mask};
         	$netsize=computeNetSize($mask);
-		#print "$network\t$mask\t$netsize\n";
+		print "IdentifyUnused: $network\t$mask\t$netsize\n";
         	$netend=$network+$netsize;
         	FillIPBlocks($network,$netend);
         	DescribeIPBlocks($network,$netend);
@@ -197,24 +226,6 @@ sub IdentifyUnused(){
 	}
 
 }
-sub FindUnknownDevices($){
-	my $public=shift;
-	$sql="select distinct IP.MAC as MAC from IP left join Devices using(MAC) where Devices.MAC is null";
-	$sth=$dbh->prepare($sql);
-	$sth->execute();
-	Log("Finding Unknown Devices");
-	my $r=$sth->fetchrow_hashref();
-	while ($r){
-		$sql="insert into Devices(MAC,Description,Active,RunNMAP,IPAutoFill,type,public) 
-values('$r->{MAC}','Unknown',1,0,1,0,\"$public\")";
-		$sth2=$dbh->prepare($sql);
-		$sth2->execute();
-		Log(".");
-		$r=$sth->fetchrow_hashref();
-	}
-	Log("\n");
-	
-}
 sub computeNetSize($){
 	my $mask=shift;
 	my $size=$mask^(0xFFFFFFFF);
@@ -226,8 +237,8 @@ sub DescribeIPBlocks($$){
 	my $network=shift;
 	my $netend=shift;
 	my $sth2;
-        $sql="select distinct RouterIPs.network,RouterIPs.mask from RouterIPs 
-	left join IPAllocations using(network,mask) where IPAllocations.network is null
+        my $sql="select distinct RouterIPs.network,RouterIPs.mask from RouterIPs 
+		left join IPAllocations using(network,mask) where IPAllocations.network is null
                 and RouterIPs.network>=$network and RouterIPs.network<$netend order by RouterIPs.network";
         my $sth=$dbh->prepare($sql);
 	$sth->execute();
@@ -243,11 +254,13 @@ sub DescribeIPBlocks($$){
 
 }
 sub FillIPBlocks($$){
+	# Get current IP block allocation info from router ip/mask combinations
+	# Then fill in blank information
 	my $network=shift;
 	my $netend=shift;
 	my $sth2;
-
-        $sql="select distinct network,mask from RouterIPs
+	my ($blocksize, $offset,$nextNet,$parentClassC);
+        my $sql="select distinct network,mask from RouterIPs
                 where network>=$network and network<$netend order by network";
 	my $sth=$dbh->prepare($sql);
 	$sth->execute();
@@ -258,13 +271,14 @@ sub FillIPBlocks($$){
 		return;
 	}
 	my $r=$sth->fetchrow_hashref();
-        my $nextNet=$r->{network};
+        $nextNet=$r->{network};
 	if ($network<$nextNet){
+		#we are going to need to "fill" free space from beginning of block to this first allocated block
 		$nextNet=$network;
 
 	}
 	while ($r){
-                $blocksize=computeNetSize($r->{mask});
+                $blocksize=computeNetSize($r->{mask});  #blocksize of this allocated block
 		$offset=0;
 		if ($r->{network}>$nextNet){
 			#fill in the free space between current net and expected nextNet
@@ -300,13 +314,15 @@ sub FillFreeSpace($$){
 	my $sth;
 	my $sql;
 
-	#printf ("FillFreeSpace:%X\t%X\n",$nextNet,$endNet);
+	Log("FillFreeSpace: parentC: $parentClassC nextNet: $nextNet endNet: $endNet\n");
 	while ($nextNet<$endNet){
 		$subnetsize=MaxSubnetSize($nextNet-$parentClassC,$endNet-$nextNet);
 		$mask=GetMask($subnetsize);
+		
         	#printf ("ffspace parent:%X\tmynet:%X\t%X\n",$parentClassC,$nextNet,$mask );
         	$sql="insert into RouterIPs(ip,address,mask,network,ifnum) values('0',0x".sprintf("%X",$nextNet).",0x".sprintf("%X",$mask).",$nextNet,0)";
 		Log($sql."\n");
+		
         	#print "\t$sql\n";
 		$sth=$dbh->prepare($sql);
 		if (!$sth){
@@ -323,22 +339,55 @@ sub FillFreeSpace($$){
 }
 
 sub log2($){
-	my $val=shift;
-	return (log $val)/(log 2);
+	#bizarre behavior by log function requires first converting to string then back to integer
+	#before using else log returns NaN
+	my $tmp=shift;
+	$tmp=$tmp.".0";
+	my $val=$tmp+0;
+	my $log2=log 2;
+	my $result=(log $val)/($log2);
+	Log("log2: $val $log2 $result\n");
+	return $result;
 }
 sub GetMask($){
 	my $size=shift;
-	$hostbits=log2($size);
+	my $hostbits=log2($size);
 	my $mask=0xFFFFFFFF;
 	$mask=$mask << $hostbits;
+	Log("size: $size hostbits: $hostbits mask: $mask\n");
 	return $mask;
+}
+sub gcd
+{
+    my $a = shift;
+    my $b = shift;
+    Log("gcd: a=$a b=$b\n");
+
+    if ($b > $a)
+    {
+        ($a, $b) = ($b , $a);
+    }
+
+    while ($a % $b > 0)
+    {
+        ($a, $b) = ($b, $a % $b);
+    }
+
+    return $b;
 }
 sub MaxSubnetSize($$){
 	my $offset=shift;
 	my $max=shift;
-	my $maxsubnetSize;
-        @v=($offset,256);
-       	$maxsubnetSize=Math::BigInt::bgcd(@v);
+	Log("offset: $offset max: $max\n");
+
+        #my @v=($offset,256);
+       	#my $maxsubnetSize=Math::BigInt::bgcd(@v);
+	my $maxsubnetSize=256;
+
+	if($offset!=0){
+		$maxsubnetSize=gcd($offset,256);
+	}
+
         while ($max<$maxsubnetSize){
        		$maxsubnetSize=$maxsubnetSize/2;
         }
@@ -346,7 +395,10 @@ sub MaxSubnetSize($$){
 		#eliminate /31's
 		#$maxsubnetSize=1;
 	}
-	return $maxsubnetSize;
+
+	Log("offset: $offset max: $max maxsub: $maxsubnetSize\n");
+	my $result=int($maxsubnetSize);
+	return $result;
 
 }
 sub ClearTable($){
@@ -360,9 +412,9 @@ sub ClearTable($){
 
 
 sub HexMac($){
-	$mac=shift;
-	@macArray=split(/\./,$mac);
-	for $i(0..5){
+	my $mac=shift;
+	my @macArray=split(/\./,$mac);
+	for my $i(0..5){
 		$macArray[$i]=sprintf("%1x",$macArray[$i]);
 		if (length($macArray[$i])==1){
 			$macArray[$i]="0".$macArray[$i];
@@ -372,9 +424,9 @@ sub HexMac($){
 	return $mac;
 }
 sub DecMac($){
-        $mac=shift;
-        @macArray=split(/\./,$mac);
-        for $i(0..5){
+        my $mac=shift;
+        my @macArray=split(/\./,$mac);
+        for my $i(0..5){
 		$macArray[$i]="0x".$macArray[$i];
                 $macArray[$i]=oct $macArray[$i];
 		$macArray[$i]=sprintf("%1d",$macArray[$i]);
@@ -386,10 +438,32 @@ sub DecMac($){
   
 sub fixMAC($){
 	my $tmp=shift;
-	if (!defined($tmp)||($tmp eq "")){
+	my $mac="";
+	my $i;
+	my $char;
+	#Log("\nfixMAC: len=".length($tmp)." $tmp -> ");
+
+	if(length($tmp)==6){
+		#12/14/05
+		#convert this ASCII to a HEX string
+		#bad results from SNMP lib since we should have gotten string length 14
+
+		for($i=0;$i<6;$i++){
+	        	$char=substr($tmp,$i,1);
+	        	$mac=$mac.sprintf("%02x",ord($char));
+		}
+		$mac="0x".$mac;
+		$tmp=$mac;
+	}
+
+
+	if (!defined($tmp)||($tmp!~m/\w+/)||(length($tmp)!=14)){
 		$mac="";
 		return $mac;
 	}
+
+
+
 	$tmp=substr($tmp,2); 
 	my @macArray=("","","","","","");
 	for my $i(0..5){
@@ -397,9 +471,65 @@ sub fixMAC($){
 	}
 
 	$mac="$macArray[0]\.$macArray[1]\.$macArray[2]\.$macArray[3]\.$macArray[4]\.$macArray[5]";
-	if ($mac eq "....."){
-		$mac="";
-	}
+	#print("$mac\n");
 	return $mac;
+}
+sub UpdateLastActive()
+{
+	my $sql="select nodeID, lastactive from Devices order by nodeID";
+	my $sth=$dbh->prepare($sql);
+	$sth->execute();
+	my $r=$sth->fetchrow_hashref();
+	my $time;
+	while($r){
+		$time=GetStampFromInterfaces($r->{nodeID});
+		#print "node: $r->{nodeID} $time";	
+		$time=GetStampFromOIDs($r->{nodeID},$time);
+		#print " -> $time $r->{lastactive}\n";	
+		if($time>$r->{lastactive}){
+			$sql="update Devices set lastactive=$time where nodeID=$r->{nodeID}";
+			$dbh->do($sql);
+		}
+		$r=$sth->fetchrow_hashref();
+	}
+
+}
+sub GetStampFromOIDs($$){
+	my $nodeID=shift;
+	my $time=shift;
+        my $sql="select lasttime as last from OID_Instances where nodeID=$nodeID";
+        my $sth=$dbh->prepare($sql);
+        $sth->execute();
+        my $r=$sth->fetchrow_hashref();
+        while($r){
+                if($r->{last}){           
+                        if($r->{last}>$time){
+                                $time=$r->{last};
+                        }
+                }
+                $r=$sth->fetchrow_hashref();
+        }
+
+        return $time;
+
+}
+sub GetStampFromInterfaces($)
+{
+	my $nodeID=shift;
+	my $sql="select Port.lastupdated from Links left join Port using(MAC) where Links.nodeID=$nodeID";
+	my $sth=$dbh->prepare($sql);
+	$sth->execute();
+        my $r=$sth->fetchrow_hashref();
+	my $time=0;
+        while($r){
+		if($r->{lastupdated}){
+			if($r->{lastupdated}>$time){
+				$time=$r->{lastupdated};
+			}
+		}
+                $r=$sth->fetchrow_hashref();
+        }
+
+	return $time;
 }
 1;

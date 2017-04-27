@@ -1,13 +1,16 @@
 #!/usr/bin/perl
 ##########################################################################################################################################
-# Program: nmap.pl
+# Program: nmap.pm
 # Author:  Christopher Hanes
-# Revision: 0.6.0
+# Revision: 1.0.0
 # Changelog:
 # 01/25/02: v0.4.0 converted to a real package; fixed prototype errors in function definations
 # 		also now integrated with probe.pl
 # 02/01/02: v0.4.1 minor corrections to code
 # 03/07/02: v0.6.0 fixed all perl warnings
+# 08/29/05: v0.7.0 added pingNetworks procedure to improve walk results
+# 09/01/05: v0.8.0 eliminated dependency upon Devices.active
+# 12/15/05: v1.0.0 major changes; eliminated use of deprecated MAC field
 ##########################################################################################################################################
 #    Copyright (C) 2001  Christopher A. Hanes
 #    
@@ -30,16 +33,19 @@ package nmap;
 
 require mycrypt;
 use globals;
+use walkfuncs;
 
-$key;
-$keyvalid;
-$dbh;
+my $key;
+my $nkey;
+my $keyvalid;
+my $dbh;
 
 
 sub Initialize($$$){
 	$dbh=shift;
 	$keyvalid=shift;
 	$key=shift;
+	$nkey=shift;
 }
 
 sub scanNext($){
@@ -47,14 +53,15 @@ sub scanNext($){
         my ($sql, $r,$sth1);
         my ($sth2,$r2);
         my %portList=();
-        $sql="select MAC, PrimaryIP as IP, Description,RunNMAP  from Devices where PrimaryIP is not null 
-                and active=1 and runNMAP=1 order by lastnmap limit $totalscans";
+	my $time=time()-3600*24*14;
+        $sql="select nodeID,MAC, PrimaryIP as IP, Description,RunNMAP  from Devices where PrimaryIP is not null 
+                and lastactive>$time and runNMAP=1 order by lastnmap limit $totalscans";
         $sth1=$dbh->prepare($sql);
         $sth1->execute();
         $r=$sth1->fetchrow_hashref();
         while($r){
                 Log("$r->{Description}\t$r->{IP}\n");
-                $sql="select Port from nmap where MAC='$r->{MAC}'";
+                $sql="select Port from nmap where nodeID=$r->{nodeID}";
                 $sth2=$dbh->prepare($sql);
                 $sth2->execute();
                 $r2=$sth2->fetchrow_hashref();
@@ -64,22 +71,23 @@ sub scanNext($){
                         $r2=$sth2->fetchrow_hashref();
                 }
                 $sth2->finish();
-
-                ClearNMAP($r->{MAC});           #this will clear out old garbage even if we don't run nmap
+		
+                ClearNMAP($r->{nodeID});           #this will clear out old garbage even if we don't run nmap
+		
                 if ($r->{RunNMAP}==1){
-                        runNMAP($r->{IP},$r->{MAC},\%portList,$keyvalid);
+                        runNMAP($r->{nodeID},$r->{IP},$r->{MAC},\%portList,$keyvalid);
                 }
                 %portList=();
-
+		
                 $r=$sth1->fetchrow_hashref();
         }
 }
 
 sub ClearNMAP($){
         my $sql;
-        $mac=shift;
-        $deletesql="delete from nmap where MAC='$mac'";
-        $updatesql="update Devices set tcpsequence='', osguess='', rating=null,ratingcomment='' where MAC='$mac'";
+        $nodeID=shift;
+        $deletesql="delete from nmap where nodeID=$nodeID";
+        $updatesql="update Devices set tcpsequence='', osguess='', rating=null,ratingcomment='' where nodeID=$nodeID";
         $sql=$deletesql;
         #print "$sql\n";
         $sth=$dbh->prepare($sql);
@@ -89,9 +97,31 @@ sub ClearNMAP($){
         $sth->execute();
 
 }
-
-sub runNMAP($$$$)
+sub pingNetworks()
 {
+	my $sql="select network,mask from IPBlocks where icmp_scan=1 order by network";;
+	my $sth=$dbh->prepare($sql);	
+	my $ip;
+	my $mask;
+	my $nmapcmd=$globals::conf{nmap};
+	my $cmd;
+	
+	$sth->execute();
+	my $r=$sth->fetchrow_hashref();
+	my $s=time();
+	while($r){
+		$ip=toIP($r->{network});
+		$mask=toNetBits($r->{mask});
+		$cmd=$nmapcmd." -sP -PE -n $ip/$mask";
+		system($cmd);
+		$r=$sth->fetchrow_hashref();
+	}
+	my $t=time()-$s;
+	print "pingNetworks took $t seconds\n";
+}
+sub runNMAP($$$$$)
+{
+	my $nodeID=shift;
 	my $host=shift;
 	my $mac=shift;
 	#my $nmap=shift;
@@ -113,7 +143,7 @@ sub runNMAP($$$$)
 
 	$nmapcmd=$globals::conf{nmap}." -I -O -v --host 200000 ".$host." |";
 	$rating="0";	
-	print "$key $nkey $cryptstate\t$nmapcmd\n";
+	print "k:$key n:$nkey c:$cryptstate\t$nmapcmd\n";
 	open(FD,$nmapcmd) or die;
 	while ($line=<FD>){
 		#print $line;
@@ -132,14 +162,15 @@ sub runNMAP($$$$)
 
 
 			Log("\t$port\t$state\t$service\t$owner\n");
-			if($portList{$port}!=1){
+			#FIX!!
+			if(!defined($portList{$port})){
 				#new port
 				$portList{$port}=3;
 			}
 			$portList{$port}=2;
 			
 
-			$sql="insert into nmap(MAC,Port,Service,State,Owner) values('$mac',$port,'$service','$state','$owner')";
+			$sql="insert into nmap(nodeID,Port,Service,State,Owner) values($nodeID,$port,'$service','$state','$owner')";
 			print "$sql\n";
 			$sth=$dbh->prepare($sql);
 			$sth->execute();
@@ -170,8 +201,8 @@ sub runNMAP($$$$)
 		$osguess=mycrypt::cryptText(1,$osguess,$key);
 		$tcpsequence=mycrypt::cryptText(1,$tcpsequence,$key);
 	}
-	$sql="update Devices set tcpsequence='$tcpsequence',
-		rating=$rating,ratingcomment='$comment', osguess='$osguess',lastnmap=$timestamp where MAC='$mac'";
+	#$osguess is undefined here...
+	$sql="update Devices set tcpsequence='$tcpsequence',rating=$rating,ratingcomment='$comment', osguess='$osguess',lastnmap=$timestamp where nodeID=$nodeID";
 	print "$sql\n";
 	$sth=$dbh->prepare($sql);
 	$sth->execute();	
@@ -200,12 +231,12 @@ sub runNMAP($$$$)
 		$changelog=mycrypt::cryptText(1,$changelog,$key);
 	}
 	#print "Changes:".$changelog."\n";
-	if (length($changelog)>0){
-		$sql="insert into nmap_changelog(MAC,timestamp,changedescription) values('$mac',$timestamp,'$changelog')";
-		print $sql;
-		$sth=$dbh->prepare($sql);
-		$sth->execute();		
-	}
+	#if (length($changelog)>0){
+	#	$sql="insert into nmap_changelog(MAC,timestamp,changedescription) values('$mac',$timestamp,'$changelog')";
+	#	print $sql;
+	#	$sth=$dbh->prepare($sql);
+	#	$sth->execute();		
+	#}
 	$changelog="";
 	$sth->finish();
 }

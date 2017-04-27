@@ -42,28 +42,47 @@ use Exporter;
 %conf=();
 
 #path to all modules
-$path;
+$path=undef;
 
-$program;
+$program=undef;
 
-$user;
-$password;
-$dsn;
+$user=undef;
+$password=undef;
+$dsn=undef;
 
 #encryption key
-$key;
+$key=undef;
 
 #encryption key validity and db encryption state 
-$keyvalid;
+$keyvalid=undef;
 
 #key is valid and data is encrypted
 $stateEncrypted=3;
 
 $typeRouter=3;
 $typeSwitch=2;
+
+
+#Name:	ipNetToMediaPhysAddress
+#Type:	OBJECT-TYPE
+#OID:	1.3.6.1.2.1.4.22.1.2
+#Full path:	
+#iso(1).org(3).dod(6).internet(1).mgmt(2).mib-2(1).ip(4).ipNetToMediaTable(22).ipNetToMediaEntry(1).ipNetToMediaPhysAddress(2)
+#Module:	RFC1213-MIB
+
 $routerOID=".1.3.6.1.2.1.4.22.1.2";
+
+
+
+#Name:	ipAddrEntry
+#Type:	OBJECT-TYPE
+#OID:	1.3.6.1.2.1.4.20.1
+#Full path:	iso(1).org(3).dod(6).internet(1).mgmt(2).mib-2(1).ip(4).ipAddrTable(20).ipAddrEntry(1)
+#Module:	RFC1213-MIB
 $routerIPOID=".1.3.6.1.2.1.4.20.1.1";
+
 $routerIPIfnumOID="1.3.6.1.2.1.4.20.1.2";
+
 $routerIPMaskOID="1.3.6.1.2.1.4.20.1.3";
 $IFDescriptionOID=".1.3.6.1.2.1.2.2.1.2";
 $IFSpeedOID=".1.3.6.1.2.1.2.2.1.5";
@@ -169,7 +188,7 @@ sub Log($){
 	if (length($message)>2){
 		$message=time2str("%c",time()).":  ".$message;
 	}
-	print $message;
+	#print $message;
         print LOG $message;
 }
 sub Shutdown(){
